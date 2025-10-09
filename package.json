@@ -1,0 +1,30 @@
+{
+    "name": "gli-ws-server",
+    "version": "1.0.0",
+    "description": "WebSocket server for GLI real-time features",
+    "main": "src/index.js",
+    "type": "module",
+    "scripts": {
+        "start": "node src/index.js",
+        "dev": "nodemon src/index.js",
+        "test": "echo \"Error: no test specified\" && exit 1"
+    },
+    "keywords": [
+        "websocket",
+        "realtime",
+        "gli"
+    ],
+    "author": "DreamFurnace",
+    "license": "ISC",
+    "dependencies": {
+        "amqplib": "^0.10.8",
+        "dotenv": "^16.3.1",
+        "jsonwebtoken": "^9.0.2",
+        "redis": "^4.6.10",
+        "uuid": "^9.0.1",
+        "ws": "^8.18.3"
+    },
+    "devDependencies": {
+        "nodemon": "^3.0.1"
+    }
+}

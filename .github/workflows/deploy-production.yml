@@ -1,0 +1,188 @@
+name: Deploy WebSocket Server to Production
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  AWS_REGION: ap-northeast-2
+  ECR_REPOSITORY: gli-websocket-production
+  ECS_CLUSTER: production-gli-cluster
+  ECS_SERVICE: production-websocket-service
+  NODE_VERSION: '20'
+
+jobs:
+  deploy:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: 체크아웃
+      uses: actions/checkout@v4
+
+    - name: AWS 자격 증명 설정
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: 환경 변수 생성
+      run: |
+        export TZ='Asia/Seoul'
+        BUILD_UID=$(date '+%m.%d-%H:%M:%S')
+        echo "BUILD_UID=$BUILD_UID" >> $GITHUB_ENV
+        echo "🎯 Generated BUILD_UID: $BUILD_UID (KST)"
+
+    - name: ECR 로그인
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v2
+
+    - name: Docker 이미지 빌드 및 푸시
+      env:
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        IMAGE_TAG: ${{ github.sha }}
+      run: |
+        echo "🐳 Docker 이미지 빌드 시작..."
+        docker buildx create --use --name gli-ws-builder || docker buildx use gli-ws-builder
+        docker buildx build \
+          --platform linux/amd64 \
+          --cache-from type=gha \
+          --cache-to type=gha,mode=max \
+          --push \
+          --build-arg BUILD_UID=${{ env.BUILD_UID }} \
+          -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
+          -t $ECR_REGISTRY/$ECR_REPOSITORY:production-latest \
+          .
+        echo "✅ Docker 이미지 빌드 및 푸시 완료"
+
+    - name: Task Definition 생성 및 등록
+      env:
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        IMAGE_TAG: ${{ github.sha }}
+      run: |
+        echo "📝 Task Definition 생성 중..."
+
+        # VPC 설정 조회
+        VPC_ID=$(aws ec2 describe-vpcs \
+          --filters "Name=is-default,Values=true" \
+          --query 'Vpcs[0].VpcId' \
+          --output text)
+
+        echo "VPC_ID=$VPC_ID" >> $GITHUB_ENV
+
+        # Task Definition JSON 생성 (Production은 더 많은 리소스 할당)
+        cat > task-definition.json <<EOF
+        {
+          "family": "production-gli-websocket",
+          "networkMode": "awsvpc",
+          "requiresCompatibilities": ["FARGATE"],
+          "cpu": "512",
+          "memory": "1024",
+          "executionRoleArn": "arn:aws:iam::917891822317:role/ecsTaskExecutionRole",
+          "taskRoleArn": "arn:aws:iam::917891822317:role/ecsTaskExecutionRole",
+          "containerDefinitions": [
+            {
+              "name": "websocket-server",
+              "image": "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG",
+              "essential": true,
+              "portMappings": [
+                {
+                  "containerPort": 8080,
+                  "protocol": "tcp"
+                }
+              ],
+              "environment": [
+                {
+                  "name": "NODE_ENV",
+                  "value": "production"
+                },
+                {
+                  "name": "BUILD_UID",
+                  "value": "${{ env.BUILD_UID }}"
+                }
+              ],
+              "logConfiguration": {
+                "logDriver": "awslogs",
+                "options": {
+                  "awslogs-group": "/ecs/production-gli-websocket",
+                  "awslogs-region": "ap-northeast-2",
+                  "awslogs-stream-prefix": "websocket",
+                  "awslogs-create-group": "true"
+                }
+              }
+            }
+          ]
+        }
+        EOF
+
+        # Task Definition 등록
+        NEW_TASK_DEF_ARN=$(aws ecs register-task-definition \
+          --cli-input-json file://task-definition.json \
+          --query 'taskDefinition.taskDefinitionArn' \
+          --output text)
+
+        echo "TASK_DEF_ARN=$NEW_TASK_DEF_ARN" >> $GITHUB_ENV
+        echo "✅ Task Definition 등록 완료: $NEW_TASK_DEF_ARN"
+
+    - name: ECS 서비스 업데이트
+      run: |
+        echo "🚀 ECS 서비스 업데이트 시작..."
+
+        # 서비스가 존재하는지 확인
+        SERVICE_EXISTS=$(aws ecs describe-services \
+          --cluster $ECS_CLUSTER \
+          --services $ECS_SERVICE \
+          --query 'services[0].serviceName' \
+          --output text 2>/dev/null || echo "")
+
+        if [ -z "$SERVICE_EXISTS" ] || [ "$SERVICE_EXISTS" = "None" ]; then
+          echo "⚠️  ECS 서비스가 존재하지 않습니다."
+          echo "서비스를 먼저 생성해야 합니다."
+          exit 1
+        fi
+
+        aws ecs update-service \
+          --cluster $ECS_CLUSTER \
+          --service $ECS_SERVICE \
+          --task-definition ${{ env.TASK_DEF_ARN }} \
+          --force-new-deployment
+
+        echo "✅ ECS 서비스 업데이트 완료"
+
+    - name: 배포 검증
+      run: |
+        echo "🔍 배포 검증 시작..."
+
+        for i in {1..120}; do
+          DEPLOYMENT_STATUS=$(aws ecs describe-services \
+            --cluster "$ECS_CLUSTER" \
+            --services "$ECS_SERVICE" \
+            --query "services[0].deployments[?status=='PRIMARY'].rolloutState" \
+            --output text)
+
+          if [ "$DEPLOYMENT_STATUS" = "COMPLETED" ]; then
+            echo "✅ 배포 성공! (${i}초)"
+            break
+          elif [ $i -eq 120 ]; then
+            echo "⚠️  배포 검증 타임아웃 (120초)"
+            break
+          fi
+
+          sleep 1
+        done
+
+    - name: 배포 완료 알림
+      if: always()
+      run: |
+        if [ "${{ job.status }}" = "success" ]; then
+          echo "🎉 GLI WebSocket Server Production 배포 성공!"
+          echo "🌐 URL: wss://ws.glibiz.com"
+          echo "🏷️  BUILD_UID: ${{ env.BUILD_UID }}"
+          echo "🐳 Image: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}"
+          echo "📌 Git SHA: ${{ github.sha }}"
+        else
+          echo "❌ GLI WebSocket Server Production 배포 실패!"
+          echo "⚠️  롤백이 필요할 수 있습니다."
+        fi

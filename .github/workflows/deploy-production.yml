@@ -101,6 +101,14 @@ jobs:
                 {
                   "name": "BUILD_UID",
                   "value": "${{ env.BUILD_UID }}"
+                },
+                {
+                  "name": "WS_PORT",
+                  "value": "8080"
+                },
+                {
+                  "name": "JWT_SECRET",
+                  "value": "${{ secrets.JWT_SECRET_PRODUCTION }}"
                 }
               ],
               "logConfiguration": {

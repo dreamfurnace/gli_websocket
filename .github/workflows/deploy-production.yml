@@ -126,9 +126,9 @@ jobs:
         echo "TASK_DEF_ARN=$NEW_TASK_DEF_ARN" >> $GITHUB_ENV
         echo "✅ Task Definition 등록 완료: $NEW_TASK_DEF_ARN"
 
-    - name: ECS 서비스 업데이트
+    - name: ECS 서비스 생성 또는 업데이트
       run: |
-        echo "🚀 ECS 서비스 업데이트 시작..."
+        echo "🚀 ECS 서비스 확인 중..."
 
         # 서비스가 존재하는지 확인
         SERVICE_EXISTS=$(aws ecs describe-services \
@@ -138,18 +138,73 @@ jobs:
           --output text 2>/dev/null || echo "")
 
         if [ -z "$SERVICE_EXISTS" ] || [ "$SERVICE_EXISTS" = "None" ]; then
-          echo "⚠️  ECS 서비스가 존재하지 않습니다."
-          echo "서비스를 먼저 생성해야 합니다."
-          exit 1
+          echo "⚠️  ECS 서비스가 존재하지 않습니다. 자동으로 생성합니다..."
+
+          # 네트워크 설정 조회
+          SUBNETS=$(aws ec2 describe-subnets \
+            --filters "Name=vpc-id,Values=${{ env.VPC_ID }}" \
+            --query 'Subnets[*].SubnetId' \
+            --output text | tr '\t' ',')
+
+          # Security Group 조회 또는 생성
+          ECS_SG=$(aws ec2 describe-security-groups \
+            --filters "Name=group-name,Values=gli-ecs-tasks-sg" \
+            --query 'SecurityGroups[0].GroupId' \
+            --output text 2>/dev/null || echo "")
+
+          if [ -z "$ECS_SG" ] || [ "$ECS_SG" = "None" ]; then
+            echo "📝 ECS Task Security Group 생성 중..."
+
+            ECS_SG=$(aws ec2 create-security-group \
+              --group-name "gli-ecs-tasks-sg" \
+              --description "Security group for GLI ECS Tasks" \
+              --vpc-id "${{ env.VPC_ID }}" \
+              --query 'GroupId' \
+              --output text)
+
+            # ALB에서 8080 포트 접근 허용
+            ALB_SG=$(aws ec2 describe-security-groups \
+              --filters "Name=group-name,Values=gli-alb-sg" \
+              --query 'SecurityGroups[0].GroupId' \
+              --output text)
+
+            aws ec2 authorize-security-group-ingress \
+              --group-id "$ECS_SG" \
+              --protocol tcp \
+              --port 8080 \
+              --source-group "$ALB_SG"
+
+            echo "✅ ECS Security Group 생성 완료: $ECS_SG"
+          fi
+
+          # Target Group ARN
+          TG_ARN="arn:aws:elasticloadbalancing:ap-northeast-2:917891822317:targetgroup/gli-prod-ws-tg/6619e0227a562cbc"
+
+          echo "📝 ECS 서비스 생성 중..."
+          aws ecs create-service \
+            --cluster $ECS_CLUSTER \
+            --service-name $ECS_SERVICE \
+            --task-definition ${{ env.TASK_DEF_ARN }} \
+            --desired-count 2 \
+            --launch-type FARGATE \
+            --platform-version LATEST \
+            --network-configuration "awsvpcConfiguration={subnets=[$SUBNETS],securityGroups=[$ECS_SG],assignPublicIp=ENABLED}" \
+            --load-balancers "targetGroupArn=$TG_ARN,containerName=websocket-server,containerPort=8080" \
+            --health-check-grace-period-seconds 60 \
+            --enable-execute-command
+
+          echo "✅ ECS 서비스 생성 완료"
+        else
+          echo "📝 기존 ECS 서비스 업데이트 중..."
+
+          aws ecs update-service \
+            --cluster $ECS_CLUSTER \
+            --service $ECS_SERVICE \
+            --task-definition ${{ env.TASK_DEF_ARN }} \
+            --force-new-deployment
+
+          echo "✅ ECS 서비스 업데이트 완료"
         fi
-
-        aws ecs update-service \
-          --cluster $ECS_CLUSTER \
-          --service $ECS_SERVICE \
-          --task-definition ${{ env.TASK_DEF_ARN }} \
-          --force-new-deployment
-
-        echo "✅ ECS 서비스 업데이트 완료"
 
     - name: 배포 검증
       run: |
